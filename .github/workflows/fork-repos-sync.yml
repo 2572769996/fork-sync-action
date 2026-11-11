@@ -2,102 +2,201 @@ name: Sync Forked Repos
 
 on:
   schedule:
-    - cron: '0 16 * * *' # 每天 UTC 时间 16:00（即北京时间凌晨 00:00）运行一次
-  workflow_dispatch: # 手动触发工作流
+    - cron: '0 16 * * *'
+  workflow_dispatch:
 
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout the code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set timezone to Asia/Shanghai
-        run: |
-          echo "Setting timezone to Asia/Shanghai"
-          sudo timedatectl set-timezone Asia/Shanghai
-
-      - name: Display current time
-        run: |
-          echo "Current time in Beijing: $(date)"
-
-      - name: Set up GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-
-      - name: Run the Sync Forked Repos script
-        run: |
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Fetching the list of repositories for OWNER: $OWNER..."
-            # 获取同步前的仓库列表和更新时间
-            before_sync_repos=$(gh repo list "$OWNER" --limit 200 --fork --json nameWithOwner,isFork,updatedAt)
-            
-            # 初始化错误计数器和仓库列表
-            error_count=0
-            failed_repos=()
-            synced_repos=()
-            
-            # 遍历所有fork仓库进行同步
-            while read -r repo; do
-                nameWithOwner=$(echo "$repo" | jq -r '.nameWithOwner')
-                before_updated_at=$(echo "$repo" | jq -r '.updatedAt')
-                
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Syncing forked repository: $nameWithOwner..."
-                
-                # 尝试同步仓库
-                if gh repo sync "$nameWithOwner" 2>&1; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully synced: $nameWithOwner"
-                    # 记录成功同步的仓库和其同步前的更新时间
-                    synced_repos+=("$nameWithOwner|$before_updated_at")
-                else
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to sync: $nameWithOwner" >&2
-                    error_count=$((error_count + 1))
-                    failed_repos+=("$nameWithOwner")
-                fi
-            done < <(echo "$before_sync_repos" | jq -c '.[]')
-            
-            # 等待10秒让GitHub API更新状态
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for GitHub API to update..."
-            sleep 10
-            
-            # 检查已同步仓库的更新状态
-            updated_repos=()
-            for repo_info in "${synced_repos[@]}"; do
-                nameWithOwner="${repo_info%|*}"
-                before_updated_at="${repo_info#*|}"
-                
-                # 获取当前更新时间
-                after_updated_at=$(gh repo view "$nameWithOwner" --json updatedAt | jq -r '.updatedAt')
-                
-                # 比较更新时间
-                if [ "$before_updated_at" != "$after_updated_at" ]; then
-                    updated_repos+=("$nameWithOwner")
-                fi
-            done
-            
-            # 显示同步结果
-            echo ""
-            echo "--------------------------------"
-            # 显示更新的仓库
-            echo "Check the repository update status..."
-            if [ ${#updated_repos[@]} -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Repositories with updates from upstream:"
-                printf '%s\n' "${updated_repos[@]}"
-                echo ""
-            fi
-            
-            # 显示失败的仓库
-            if [ $error_count -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync completed with $error_count failures"
-                echo "Failed repositories:"
-                printf '%s\n' "${failed_repos[@]}"
-                exit 1
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] All repositories synced successfully"
-            fi
-            echo "--------------------------------"
-
+      - name: Sync fork default branches
         env:
-            GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
-            OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          gh auth setup-git
+
+          work_root=$(mktemp -d)
+          trap 'rm -rf "$work_root"' EXIT
+          run_stamp="$(date -u '+%Y%m%dT%H%M%SZ')-${GITHUB_RUN_ID}"
+
+          repo_fail_count=0
+          skipped_repo_count=0
+
+          echo "Listing fork repositories for $OWNER..."
+          if ! repo_json=$(gh repo list "$OWNER" --limit 1000 --fork --json nameWithOwner); then
+            echo "::error::Could not list fork repositories. Check SYNC_GITHUB_TOKEN permissions."
+            exit 1
+          fi
+
+          mapfile -t repos < <(jq -r '.[].nameWithOwner' <<< "$repo_json")
+
+          for repo in "${repos[@]}"; do
+            echo
+            echo "Processing $repo"
+
+            # A repo may have been deleted or become inaccessible after listing.
+            if ! repo_meta=$(gh api "repos/$repo"); then
+              echo "Skipping $repo: repository is deleted or inaccessible."
+              skipped_repo_count=$((skipped_repo_count + 1))
+              continue
+            fi
+
+            upstream=$(jq -r '.parent.full_name // empty' <<< "$repo_meta")
+            fork_default_branch=$(jq -r '.default_branch // empty' <<< "$repo_meta")
+
+            if [[ -z "$upstream" ]]; then
+              echo "Skipping $repo: no upstream repository found."
+              skipped_repo_count=$((skipped_repo_count + 1))
+              continue
+            fi
+
+            # The upstream may also have been deleted or become inaccessible.
+            if ! upstream_meta=$(gh api "repos/$upstream"); then
+              echo "Skipping $repo: upstream $upstream is deleted or inaccessible."
+              skipped_repo_count=$((skipped_repo_count + 1))
+              continue
+            fi
+
+            upstream_default_branch=$(jq -r '.default_branch // empty' <<< "$upstream_meta")
+            if [[ -z "$upstream_default_branch" ]]; then
+              echo "Could not determine the upstream default branch for $repo."
+              repo_fail_count=$((repo_fail_count + 1))
+              continue
+            fi
+
+            repo_dir="$work_root/${repo//\//__}.git"
+            if ! git init --bare "$repo_dir" >/dev/null 2>&1 ||
+               ! git -C "$repo_dir" remote add upstream "https://github.com/$upstream.git" ||
+               ! git -C "$repo_dir" remote add fork "https://github.com/$repo.git"; then
+              echo "Failed to initialize Git for $repo."
+              repo_fail_count=$((repo_fail_count + 1))
+              continue
+            fi
+
+            if ! git -C "$repo_dir" fetch upstream '+refs/heads/*:refs/remotes/upstream/*'; then
+              echo "Failed to fetch upstream branches for $repo."
+              repo_fail_count=$((repo_fail_count + 1))
+              continue
+            fi
+
+            if ! git -C "$repo_dir" fetch fork '+refs/heads/*:refs/remotes/fork/*'; then
+              echo "Failed to fetch fork branches for $repo."
+              repo_fail_count=$((repo_fail_count + 1))
+              continue
+            fi
+
+            upstream_ref="refs/remotes/upstream/$upstream_default_branch"
+            fork_ref="refs/remotes/fork/$upstream_default_branch"
+            sync_ok=1
+
+            if ! git -C "$repo_dir" show-ref --verify --quiet "$upstream_ref"; then
+              echo "Upstream default branch '$upstream_default_branch' was not found for $repo."
+              sync_ok=0
+              repo_fail_count=$((repo_fail_count + 1))
+            else
+              upstream_sha=$(git -C "$repo_dir" rev-parse "$upstream_ref")
+
+              if git -C "$repo_dir" show-ref --verify --quiet "$fork_ref"; then
+                fork_sha=$(git -C "$repo_dir" rev-parse "$fork_ref")
+
+                if [[ "$fork_sha" == "$upstream_sha" ]]; then
+                  echo "Default branch $repo:$upstream_default_branch is already up to date."
+                elif git -C "$repo_dir" merge-base --is-ancestor "$fork_ref" "$upstream_ref"; then
+                  echo "Fast-forwarding $repo:$upstream_default_branch."
+                  if ! git -C "$repo_dir" push fork "$upstream_ref:refs/heads/$upstream_default_branch"; then
+                    echo "Failed to update $repo:$upstream_default_branch."
+                    sync_ok=0
+                    repo_fail_count=$((repo_fail_count + 1))
+                  fi
+                else
+                  # Preserve the old fork tip in the fork before force-updating.
+                  backup_ref="refs/tags/fork-sync-backup/$run_stamp/$upstream_default_branch"
+                  if ! git -C "$repo_dir" update-ref "$backup_ref" "$fork_sha" ||
+                     ! git -C "$repo_dir" push fork "$backup_ref:$backup_ref"; then
+                    echo "Could not save backup for $repo:$upstream_default_branch; refusing to overwrite it."
+                    sync_ok=0
+                    repo_fail_count=$((repo_fail_count + 1))
+                  else
+                    echo "Force-updating $repo:$upstream_default_branch (old=$fork_sha, new=$upstream_sha, backup=$backup_ref)."
+                    if ! git -C "$repo_dir" push --force fork "$upstream_ref:refs/heads/$upstream_default_branch"; then
+                      echo "Failed to force-update $repo:$upstream_default_branch; backup retained at $backup_ref."
+                      sync_ok=0
+                      repo_fail_count=$((repo_fail_count + 1))
+                    fi
+                  fi
+                fi
+              else
+                echo "Creating missing default branch $repo:$upstream_default_branch."
+                if ! git -C "$repo_dir" push fork "$upstream_ref:refs/heads/$upstream_default_branch"; then
+                  echo "Failed to create $repo:$upstream_default_branch."
+                  sync_ok=0
+                  repo_fail_count=$((repo_fail_count + 1))
+                fi
+              fi
+            fi
+
+            # Keep the fork's default-branch setting aligned with upstream before pruning.
+            # GitHub will not allow deleting the branch currently set as the fork default.
+            if [[ "$sync_ok" == "1" && "$fork_default_branch" != "$upstream_default_branch" ]]; then
+              if gh api --method PATCH "repos/$repo" -f "default_branch=$upstream_default_branch" >/dev/null; then
+                echo "Set $repo default branch to $upstream_default_branch."
+                fork_default_branch="$upstream_default_branch"
+              else
+                echo "Could not change $repo default branch to $upstream_default_branch."
+                repo_fail_count=$((repo_fail_count + 1))
+              fi
+            fi
+
+            # Delete fork branches that no longer exist upstream.
+            # Other branches that still exist upstream are left unchanged.
+            mapfile -t upstream_branches < <(
+              git -C "$repo_dir" for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream
+            )
+            mapfile -t fork_branches < <(
+              git -C "$repo_dir" for-each-ref --format='%(refname:strip=3)' refs/remotes/fork
+            )
+
+            for branch in "${fork_branches[@]}"; do
+              exists_upstream=0
+              for upstream_branch in "${upstream_branches[@]}"; do
+                if [[ "$branch" == "$upstream_branch" ]]; then
+                  exists_upstream=1
+                  break
+                fi
+              done
+
+              if ((exists_upstream)); then
+                continue
+              fi
+
+              if [[ "$branch" == "$fork_default_branch" ]]; then
+                echo "Cannot delete $repo:$branch because it is still the fork's default branch."
+                repo_fail_count=$((repo_fail_count + 1))
+                continue
+              fi
+
+              echo "Deleting $repo:$branch because the branch no longer exists upstream."
+              if ! git -C "$repo_dir" push fork ":refs/heads/$branch"; then
+                echo "Failed to delete $repo:$branch."
+                repo_fail_count=$((repo_fail_count + 1))
+              fi
+            done
+          done
+
+          echo
+          echo "Skipped repositories (deleted/inaccessible/no upstream): $skipped_repo_count"
+          echo "Failures: $repo_fail_count"
+
+          if ((repo_fail_count > 0)); then
+            exit 1
+          fi
