@@ -2,102 +2,217 @@ name: Sync Forked Repos
 
 on:
   schedule:
-    - cron: '0 16 * * *' # 每天 UTC 时间 16:00（即北京时间凌晨 00:00）运行一次
-  workflow_dispatch: # 手动触发工作流
+    - cron: '0 16 * * *'
+  workflow_dispatch:
 
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout the code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set timezone to Asia/Shanghai
-        run: |
-          echo "Setting timezone to Asia/Shanghai"
-          sudo timedatectl set-timezone Asia/Shanghai
-
-      - name: Display current time
-        run: |
-          echo "Current time in Beijing: $(date)"
-
-      - name: Set up GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-
-      - name: Run the Sync Forked Repos script
-        run: |
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Fetching the list of repositories for OWNER: $OWNER..."
-            # 获取同步前的仓库列表和更新时间
-            before_sync_repos=$(gh repo list "$OWNER" --limit 200 --fork --json nameWithOwner,isFork,updatedAt)
-            
-            # 初始化错误计数器和仓库列表
-            error_count=0
-            failed_repos=()
-            synced_repos=()
-            
-            # 遍历所有fork仓库进行同步
-            while read -r repo; do
-                nameWithOwner=$(echo "$repo" | jq -r '.nameWithOwner')
-                before_updated_at=$(echo "$repo" | jq -r '.updatedAt')
-                
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Syncing forked repository: $nameWithOwner..."
-                
-                # 尝试同步仓库
-                if gh repo sync "$nameWithOwner" 2>&1; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully synced: $nameWithOwner"
-                    # 记录成功同步的仓库和其同步前的更新时间
-                    synced_repos+=("$nameWithOwner|$before_updated_at")
-                else
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to sync: $nameWithOwner" >&2
-                    error_count=$((error_count + 1))
-                    failed_repos+=("$nameWithOwner")
-                fi
-            done < <(echo "$before_sync_repos" | jq -c '.[]')
-            
-            # 等待10秒让GitHub API更新状态
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for GitHub API to update..."
-            sleep 10
-            
-            # 检查已同步仓库的更新状态
-            updated_repos=()
-            for repo_info in "${synced_repos[@]}"; do
-                nameWithOwner="${repo_info%|*}"
-                before_updated_at="${repo_info#*|}"
-                
-                # 获取当前更新时间
-                after_updated_at=$(gh repo view "$nameWithOwner" --json updatedAt | jq -r '.updatedAt')
-                
-                # 比较更新时间
-                if [ "$before_updated_at" != "$after_updated_at" ]; then
-                    updated_repos+=("$nameWithOwner")
-                fi
-            done
-            
-            # 显示同步结果
-            echo ""
-            echo "--------------------------------"
-            # 显示更新的仓库
-            echo "Check the repository update status..."
-            if [ ${#updated_repos[@]} -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Repositories with updates from upstream:"
-                printf '%s\n' "${updated_repos[@]}"
-                echo ""
-            fi
-            
-            # 显示失败的仓库
-            if [ $error_count -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync completed with $error_count failures"
-                echo "Failed repositories:"
-                printf '%s\n' "${failed_repos[@]}"
-                exit 1
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] All repositories synced successfully"
-            fi
-            echo "--------------------------------"
-
+      - name: Sync fork default branches with per-repo timeout
         env:
-            GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
-            OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          gh auth setup-git
+
+          work_root=$(mktemp -d)
+          trap 'rm -rf "$work_root"' EXIT
+          report_file="$work_root/fork-sync-report.md"
+          run_stamp="$(date -u '+%Y%m%dT%H%M%SZ')-${GITHUB_RUN_ID}"
+
+          # Single-repo worker: do one repo and return explicit exit codes.
+          cat > "$work_root/sync-one-repo.sh" <<'WORKER'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          repo="$1"
+          result_file="$2"
+          run_stamp="$3"
+
+          skip_repo() {
+            printf -- '- %s\\n' "$1" >> "$result_file"
+            exit 10
+          }
+
+          fail_repo() {
+            printf -- '- %s\\n' "$1" >> "$result_file"
+            exit 1
+          }
+
+          echo "Processing $repo"
+
+          if ! repo_meta=$(gh api "repos/$repo" 2>&1); then
+            skip_repo "`${repo}`: repository is missing or inaccessible; skipped."
+          fi
+
+          upstream=$(jq -r '.parent.full_name // empty' <<< "$repo_meta")
+          if [[ -z "$upstream" ]]; then
+            skip_repo "`${repo}`: no upstream repository; skipped."
+          fi
+
+          if ! upstream_meta=$(gh api "repos/$upstream" 2>&1); then
+            skip_repo "`${repo}`: upstream `${upstream}` is missing or inaccessible; skipped."
+          fi
+
+          default_branch=$(jq -r '.default_branch // empty' <<< "$upstream_meta")
+          if [[ -z "$default_branch" ]]; then
+            fail_repo "`${repo}`: could not determine upstream default branch."
+          fi
+
+          # Only fetch the default branch, not all branches.
+          # This keeps disk usage low and avoids the earlier runner disk-full issue.
+          if ! git ls-remote --heads "https://github.com/$upstream.git" "refs/heads/$default_branch" >/tmp/upstream_ref.txt 2>/tmp/upstream_err.txt; then
+            fail_repo "`${repo}`: failed to list upstream default branch `${default_branch}`. $(cat /tmp/upstream_err.txt 2>/dev/null | tr '\n' ' ')"
+          fi
+          if ! git ls-remote --heads "https://github.com/$repo.git" "refs/heads/$default_branch" >/tmp/fork_ref.txt 2>/tmp/fork_err.txt; then
+            fail_repo "`${repo}`: failed to list fork default branch `${default_branch}`. $(cat /tmp/fork_err.txt 2>/dev/null | tr '\n' ' ')"
+          fi
+
+          upstream_sha=$(awk '{print $1}' /tmp/upstream_ref.txt)
+          if [[ -z "$upstream_sha" ]]; then
+            fail_repo "`${repo}`: upstream default branch `${default_branch}` is missing."
+          fi
+
+          fork_sha=$(awk '{print $1}' /tmp/fork_ref.txt 2>/dev/null || true)
+          if [[ -z "$fork_sha" ]]; then
+            echo "Creating missing default branch $repo:$default_branch"
+            if ! gh api --method POST "repos/$repo/git/refs" \
+              -f "ref=refs/heads/$default_branch" \
+              -f "sha=$upstream_sha" >/dev/null; then
+              fail_repo "`${repo}` branch `${default_branch}`: failed to create missing default branch."
+            fi
+            printf -- '- Created missing default branch `%s` at `%s`.\\n' "$default_branch" "$upstream_sha" >> "$result_file"
+            exit 0
+          fi
+
+          if [[ "$fork_sha" == "$upstream_sha" ]]; then
+            echo "Default branch already up to date: $repo:$default_branch"
+            printf -- '- `%s`: default branch `%s` already matches upstream.\\n' "$repo" "$default_branch" >> "$result_file"
+            exit 0
+          fi
+
+          # Try a normal fast-forward update first.
+          if gh api --method PATCH "repos/$repo/git/refs/heads/$default_branch" \
+            -f "sha=$upstream_sha" \
+            -F force=false >/dev/null 2>&1; then
+            echo "Fast-forwarded $repo:$default_branch"
+            printf -- '- Fast-forwarded `%s` branch `%s` from `%s` to `%s`.\\n' "$repo" "$default_branch" "$fork_sha" "$upstream_sha" >> "$result_file"
+            exit 0
+          fi
+
+          # Diverged history: retain old tip in a backup ref, then force push.
+          safe_branch=${default_branch//\//--}
+          backup_ref="refs/tags/fork-sync-backup/$run_stamp/$safe_branch"
+
+          echo "Force-updating diverged default branch $repo:$default_branch"
+          if ! gh api --method POST "repos/$repo/git/refs" \
+            -f "ref=$backup_ref" \
+            -f "sha=$fork_sha" >/dev/null; then
+            fail_repo "`${repo}` branch `${default_branch}`: could not save backup of old commit `${fork_sha}`."
+          fi
+
+          if ! gh api --method PATCH "repos/$repo/git/refs/heads/$default_branch" \
+            -f "sha=$upstream_sha" \
+            -F force=true >/dev/null; then
+            fail_repo "`${repo}` branch `${default_branch}`: force update failed; backup retained as `${backup_ref}`."
+          fi
+
+          printf -- '- **Force-updated** `%s` branch `%s`: `%s` → `%s`; backup tag `%s`.\\n' \
+            "$repo" "$default_branch" "$fork_sha" "$upstream_sha" "$backup_ref" >> "$result_file"
+          exit 0
+          WORKER
+          chmod +x "$work_root/sync-one-repo.sh"
+
+          # List all fork repos once.
+          echo "Listing fork repositories for $OWNER..."
+          if ! repo_json=$(gh repo list "$OWNER" --limit 1000 --fork --json nameWithOwner); then
+            echo "::error::Could not list fork repositories; check SYNC_GITHUB_TOKEN permissions."
+            exit 1
+          fi
+
+          mapfile -t repos < <(jq -r '.[].nameWithOwner' <<< "$repo_json")
+          total_count=${#repos[@]}
+
+          success_count=0
+          skipped_count=0
+          timeout_count=0
+          failed_count=0
+
+          : > "$report_file"
+          {
+            echo '# Fork synchronization report'
+            echo
+            echo "Run time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo
+            echo "Per-repository timeout: 60 seconds"
+            echo
+            echo '## Results'
+            echo
+          } >> "$report_file"
+
+          index=0
+          for repo in "${repos[@]}"; do
+            index=$((index + 1))
+            result_file="$work_root/result-$index.md"
+            : > "$result_file"
+
+            echo "[$index/$total_count] $repo"
+
+            set +e
+            timeout --signal=TERM --kill-after=5s 60s \
+              bash "$work_root/sync-one-repo.sh" "$repo" "$result_file" "$run_stamp"
+            exit_code=$?
+            set -e
+
+            case "$exit_code" in
+              0)
+                success_count=$((success_count + 1))
+                ;;
+              10)
+                skipped_count=$((skipped_count + 1))
+                ;;
+              124|137)
+                timeout_count=$((timeout_count + 1))
+                printf -- '- **TIMEOUT** `%s`: exceeded 60 seconds.\\n' "$repo" >> "$result_file"
+                echo "::warning title=Repository sync timed out::$repo exceeded 60 seconds and was skipped."
+                ;;
+              *)
+                failed_count=$((failed_count + 1))
+                if [[ ! -s "$result_file" ]]; then
+                  printf -- '- **FAILED** `%s`: exit code %s.\\n' "$repo" "$exit_code" >> "$result_file"
+                fi
+                ;;
+            esac
+
+            cat "$result_file" >> "$report_file"
+            rm -f "$result_file"
+          done
+
+          {
+            echo
+            echo '## Totals'
+            echo
+            echo "- Repos listed: $total_count"
+            echo "- Succeeded: $success_count"
+            echo "- Skipped: $skipped_count"
+            echo "- Timed out: $timeout_count"
+            echo "- Failed: $failed_count"
+          } >> "$report_file"
+
+          cat "$report_file" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Summary: listed=$total_count success=$success_count skipped=$skipped_count timed_out=$timeout_count failed=$failed_count"
+
+          if (( timeout_count > 0 || failed_count > 0 )); then
+            exit 1
+          fi
