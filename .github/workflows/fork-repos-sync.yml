@@ -153,8 +153,6 @@ jobs:
           elif [[ "$fork_sha" == "$upstream_sha" ]]; then
             echo "Default branch $repo:$default_branch is already up to date"
           else
-            # Try a normal fast-forward first. If rejected, save the old tip
-            # in a backup tag before attempting a force update.
             if gh api --method PATCH \
               "repos/$repo/git/refs/heads/$default_branch" \
               -f "sha=$upstream_sha" \
@@ -187,8 +185,6 @@ jobs:
             fi
           fi
 
-          # Align the fork's default-branch setting before pruning branches,
-          # so GitHub permits deletion if its former default branch was removed upstream.
           if [[ "$fork_default_branch" != "$default_branch" ]]; then
             if ! gh api --method PATCH "repos/$repo" \
               -f "default_branch=$default_branch" >/dev/null; then
@@ -196,8 +192,6 @@ jobs:
             fi
           fi
 
-          # Delete fork branches that no longer exist upstream.
-          # Existing non-default branches are not synchronized.
           for branch in "${!fork_sha_by_branch[@]}"; do
             if [[ -n "${upstream_sha_by_branch[$branch]:-}" ]]; then
               continue
@@ -233,13 +227,11 @@ jobs:
           mapfile -t listed_repos < <(jq -r '.[].nameWithOwner' <<< "$repo_json")
 
           repos=()
-          excluded_count=0
           current_repo="${GITHUB_REPOSITORY,,}"
 
           for repo in "${listed_repos[@]}"; do
             if [[ "${repo,,}" == "$current_repo" ]]; then
-              echo "Excluding this workflow repository from synchronization: $repo"
-              excluded_count=$((excluded_count + 1))
+              echo "Excluding self repository: $repo"
               continue
             fi
             repos+=("$repo")
@@ -255,8 +247,8 @@ jobs:
             echo '# Fork synchronization report'
             echo
             echo "Run time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo
             echo 'Per-repository timeout: 60 seconds'
-            echo "Excluded workflow repository: $GITHUB_REPOSITORY"
             echo
             echo '## Results'
             echo
@@ -307,7 +299,6 @@ jobs:
             echo '## Totals'
             echo
             echo "- Forks listed: ${#listed_repos[@]}"
-            echo "- Excluded self: $excluded_count"
             echo "- Repositories processed: $total_count"
             echo "- Succeeded: $success_count"
             echo "- Skipped: $skipped_count"
@@ -318,7 +309,6 @@ jobs:
           cat "$report_file" >> "$GITHUB_STEP_SUMMARY"
 
           echo "Summary: processed=$total_count success=$success_count skipped=$skipped_count timed_out=$timeout_count failed=$failed_count"
-
-          if ((timeout_count > 0 || failed_count > 0)); then
+          if (( timeout_count > 0 || failed_count > 0 )); then
             exit 1
           fi
